@@ -1,0 +1,136 @@
+version: "3.9"
+
+# ==============================================================
+# FinFolio — Docker Compose
+# Spins up: PostgreSQL, Redis, Node.js API, FastAPI, React Dev
+# ==============================================================
+
+services:
+  # ─────────────────────────────────────────────────────────────
+  # PostgreSQL — Primary database
+  # ─────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: finfolio_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-finfolio}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-finfolio_secret}
+      POSTGRES_DB: ${POSTGRES_DB:-finfolio_db}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-finfolio} -d ${POSTGRES_DB:-finfolio_db}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - finfolio_net
+
+  # ─────────────────────────────────────────────────────────────
+  # Redis — Caching layer (60-second TTL for portfolio data)
+  # ─────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: finfolio_redis
+    restart: unless-stopped
+    command: redis-server --requirepass ${REDIS_PASSWORD:-redis_secret}
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - finfolio_net
+
+  # ─────────────────────────────────────────────────────────────
+  # Node.js API Gateway — Express + TypeScript (port 3001)
+  # Handles CRUD, portfolio holdings, Redis caching
+  # ─────────────────────────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: finfolio_backend
+    restart: unless-stopped
+    environment:
+      NODE_ENV: development
+      PORT: 3001
+      DATABASE_URL: postgresql://${POSTGRES_USER:-finfolio}:${POSTGRES_PASSWORD:-finfolio_secret}@postgres:5432/${POSTGRES_DB:-finfolio_db}
+      REDIS_URL: redis://:${REDIS_PASSWORD:-redis_secret}@redis:6379
+      ANALYTICS_URL: http://analytics:8000
+      JWT_SECRET: ${JWT_SECRET:-supersecretjwtkey}
+    ports:
+      - "3001:3001"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./backend/src:/app/src   # hot-reload in dev
+    networks:
+      - finfolio_net
+
+  # ─────────────────────────────────────────────────────────────
+  # FastAPI Analytics Microservice — Python (port 8000)
+  # Runs complex window functions for financial analytics
+  # Connects to the read-replica (same DB in dev, separate in prod)
+  # ─────────────────────────────────────────────────────────────
+  analytics:
+    build:
+      context: ./analytics
+      dockerfile: Dockerfile
+    container_name: finfolio_analytics
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-finfolio}:${POSTGRES_PASSWORD:-finfolio_secret}@postgres:5432/${POSTGRES_DB:-finfolio_db}
+      REDIS_URL: redis://:${REDIS_PASSWORD:-redis_secret}@redis:6379
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - finfolio_net
+
+  # ─────────────────────────────────────────────────────────────
+  # React Frontend — Vite Dev Server (port 5173)
+  # Proxies /api → backend:3001, /analytics → analytics:8000
+  # ─────────────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: finfolio_frontend
+    restart: unless-stopped
+    environment:
+      VITE_API_URL: http://backend:3001
+      VITE_ANALYTICS_URL: http://analytics:8000
+    ports:
+      - "5173:5173"
+    depends_on:
+      - backend
+      - analytics
+    volumes:
+      - ./frontend/src:/app/src   # hot-reload in dev
+    networks:
+      - finfolio_net
+
+# ─────────────────────────────────────────────────────────────
+# Named volumes & shared network
+# ─────────────────────────────────────────────────────────────
+volumes:
+  postgres_data:
+  redis_data:
+
+networks:
+  finfolio_net:
+    driver: bridge
